@@ -29,7 +29,7 @@
 
             ClientSecretCredential spn = new ClientSecretCredential(options.TenantId, options.ClientId, options.Secret);
 
-            this.graphClient = new (spn);
+            this.graphClient = new(spn);
         }
 
         public SendResponse Send(IFluentEmail email, CancellationToken? token = null)
@@ -39,18 +39,69 @@
 
         public async Task<SendResponse> SendAsync(IFluentEmail email, CancellationToken? token = null)
         {
+            int minimumSizeLimit = 1024 * 1024 * 3;
             try
             {
-                var message = CreateMessage(email);
-                await this.graphClient.Users[email.Data.FromAddress.EmailAddress]
-                    .SendMail(message, this.saveSent)
-                    .Request()
-                    .PostAsync();
+                var rawMessage = CreateMessage(email);
+
+                var message = await this.graphClient.Users[email.Data.FromAddress.EmailAddress].Messages.Request().AddAsync(rawMessage);
+
+                if (email.Data.Attachments != null && email.Data.Attachments.Count > 0)
+                {
+                    foreach (var attachment in email.Data.Attachments)
+                    {
+                        await UploadFileAttachment(attachment);
+                    }
+                }
+
+                await this.graphClient.Users[email.Data.FromAddress.EmailAddress].Messages[message.Id].Send().Request().PostAsync();
 
                 return new SendResponse
                 {
                     MessageId = message.Id,
                 };
+
+                async Task UploadFileAttachment(Core.Models.Attachment a)
+                {
+                    var theBytes = GetAttachmentBytes(a.Data);
+                    if (theBytes.Length < minimumSizeLimit)
+                    {
+                        await UploadSmall();
+                    }
+                    else
+                    {
+                        await UploadLarge();
+                    }
+
+                    async Task UploadLarge()
+                    {
+                        var attachment = new AttachmentItem
+                        {
+                            Name = a.Filename,
+                            AttachmentType = AttachmentType.File,
+                            Size = theBytes.Length
+                        };
+
+                        var uploadSession = await this.graphClient.Users[email.Data.FromAddress.EmailAddress].Messages[message.Id].Attachments.CreateUploadSession(attachment).Request().PostAsync();
+
+                        var largeFileUpload = new LargeFileUploadTask<AttachmentItem>(uploadSession, a.Data);
+
+                        var uploadedFile = await largeFileUpload.UploadAsync();
+                        var success = uploadedFile.UploadSucceeded;
+                    }
+
+                    async Task UploadSmall()
+                    {
+                        var attachment = new FileAttachment
+                        {
+                            Name = a.Filename,
+                            ContentType = a.ContentType,
+                            ContentBytes = theBytes
+                        };
+
+                        await this.graphClient.Users[email.Data.FromAddress.EmailAddress].Messages[message.Id].Attachments.Request().AddAsync(attachment);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -60,7 +111,6 @@
                 };
             }
         }
-
         private static Message CreateMessage(IFluentEmail email)
         {
             var messageBody = new ItemBody
@@ -77,24 +127,6 @@
             message.ToRecipients = CreateRecipientList(email.Data.ToAddresses);
             message.CcRecipients = CreateRecipientList(email.Data.CcAddresses);
             message.BccRecipients = CreateRecipientList(email.Data.BccAddresses);
-
-            if (email.Data.Attachments != null && email.Data.Attachments.Count > 0)
-            {
-                message.Attachments = new MessageAttachmentsCollectionPage();
-
-                email.Data.Attachments.ForEach(
-                    a =>
-                    {
-                        var attachment = new FileAttachment
-                        {
-                            Name = a.Filename,
-                            ContentType = a.ContentType,
-                            ContentBytes = GetAttachmentBytes(a.Data),
-                        };
-
-                        message.Attachments.Add(attachment);
-                    });
-            }
 
             switch (email.Data.Priority)
             {
